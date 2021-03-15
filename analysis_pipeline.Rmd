@@ -1,0 +1,367 @@
+---
+title: "Infected Shoulders: Analysis Pipeline"
+author: "Enterprise Analytics"
+date: "`r paste0('Last Updated: ', format(Sys.time(), '%d %B, %Y')) `"
+keywords: 
+  - Heart and Vascular
+  - population health
+  - Geo Data
+output: 
+  eatemplates::ea_report:
+    analyst: 
+    - "P. Walker"
+    email: "philip.walker@conehealth.com"
+    draft: false
+    code_folding: "show" # one of "show", "hide", or "none"
+    code_download: FALSE # TRUE to allow the Rmd to be downloaded or FALSE
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+knitr::opts_chunk$set(fig.align = 'center',out.width="80%")
+library(tidyverse)
+# library(eaverse)
+library(eastyle)
+library(eadb)
+library(gt)
+library(DBI)
+library(glue)
+library(lubridate)
+library(openxlsx)
+# To Turn off Scientific Notation Use this.
+options(scipen = 999)
+
+InfecDX <- readxl::read_excel(here::here("notes", "PSI_Appendix_F.xlsx"), sheet = "dx_only") %>% 
+  pull(DX_code)
+
+
+```
+
+# Build Procedue List
+```{r}
+
+keywords <- paste(c(
+  # from feedback on 11/10/2020
+  "SHOULDER ARTHROPLASTY", "TOTAL SHOULDER", "SHOULDER REPLACEMENT", "ARTHROPLASTY", "SHOULDER REVERSE REPLACEMENT", "SHOULDER REVISION",
+  # from feedback on 1/5/2021
+  "IRRIGATION AND DEBRIDEMENT", "IRRIGATION & DEBRIDEMENT", "ARTHROSCOPIC", "ARTHROSCOPY","INCISION AND DRAINAGE", "INCISION & DRAINAGE",
+  # from feedback on 1/15/2021
+  "TOTAL SHOULDER", "SHOULDER ARTHROPLASTY", "SHOULDER REPLACEMENT", "SHOULDER SCOPE", "SHOULDER WASHOUTS", "SHOULDER IRRIGATION & DEBRIDEMENT"
+  ),
+  collapse = "|")
+
+```
+
+# Pull Historical Surgery Data
+
+```{r}
+
+
+shoulders_Output <- 
+  submit_edw_query(
+    template = "
+      SELECT bbb.[PatientEncounterID], a.[LogID],[LogNM],[SurgeryDTS] ,[CaseClassDSC], a.PatientID 
+    ,c.MRN, [PatientTypeDSC] ,[TotalTimeNeededMinutesNBR] ,[RoomID],[StatusDSC] ,[ServiceDSC] 
+    ,[ScheduleStartDTS] ,[ProcessedByEndOfDayFLG] ,[CaseRequestID],[InpatientDataID] ,[ProcedureLevelDSC] 
+    ,[TimingEventStatusDSC] ,a.[CaseID],[EmergencyStatusStoredFLG],[UseProcedureFLG]  ,[PrimaryPhysicianID]
+    ,d.[ProviderNM] ,b.[AsOrderedProcedureNM], b.[ProcedureID], b.[BodySectionDSC], b.[BodyRegionDSC] 
+	  ,bb.[DepartmentDSC] ,bb.[ExternalNM] ,bb.[RevenueLocationNM]
+  FROM [Epic].[Surgery].[SurgicalLog] a
+    left join [Epic].[Surgery].[LogAllProcedure] b on a.logid = b.logid
+	  left join [Epic].[Surgery].[AdmissionLink] bbb on a.logid = bbb.logid
+    left join epic.patient.patient c on a.patientid = c.patientid
+	  left join [Epic].[Reference].[Resource1] d on a.primaryphysicianid = d.[ProviderID]
+	  left join [Epic].[Surgery].[Location] aa on a.[LocationID] = aa.[LocationID]
+	  left join [Epic].[Reference].[Department] bb on aa.[OperatingRoomDepartmentID] = bb.[DepartmentID]
+  where servicedsc in ('Orthopedics')
+    and surgerydts >= '2014-01-01'
+    and b.BodyRegionDSC in ('Shoulder')
+  order by surgerydts",
+    edw_dsn = "MCCBIEDW1",
+    show_query = T
+)
+
+
+shoulders_Output <-
+  shoulders_Output %>% 
+  mutate(AsOrderedProcedureNM = toupper(trimws(iconv(AsOrderedProcedureNM, "UTF-8", "UTF-8",sub=''))),
+         InProcedures = str_detect(toupper(trimws(AsOrderedProcedureNM)), keywords),
+         DT = as.Date(SurgeryDTS)) %>% 
+  ungroup()
+
+
+save(shoulders_Output, file = here::here("data-raw", "shoulders_Output.rda"))  
+
+
+MaxDT <- max(shoulders_Output$DT, na.rm=T)
+MinDT <- min(shoulders_Output$DT, na.rm=T)
+
+```
+
+```{r}
+ProcedID <-
+  shoulders_Output %>% 
+  filter(InProcedures == T) %>% 
+  distinct(ProcedureID) %>% 
+  pull(ProcedureID)
+  
+
+shoulders_Output <-
+  shoulders_Output %>% 
+  mutate(InProcID = ifelse(ProcedureID %in% ProcedID, T,F),
+         InProcedures = ifelse(is.na(InProcedures), F, InProcedures),
+         Proced_Match = InProcID + InProcedures)
+
+
+
+```
+
+
+
+## Procedure Review
+```{r}
+
+shoulders_Output %>% 
+  count(Proced_Match, sort=T)
+
+IncludedProc <-
+  shoulders_Output %>% 
+  filter(Proced_Match != 0) %>% 
+  count(ProcedureID, AsOrderedProcedureNM) %>% 
+  group_by(ProcedureID) %>% 
+  mutate(TotalByPID = sum(n)) %>% 
+  ungroup() %>% 
+  arrange(desc(TotalByPID), desc(n)) %>% 
+  # head(6) %>%
+  ungroup()
+
+
+```
+
+
+
+# Pull Infections Dx
+Per Heather (2021.01.15): "They do want infections up to 6 months post-surgery and a time span of the last 5 years from 2019"
+
+```{r}
+pat <- 
+  shoulders_Output %>% 
+  distinct(PatientID) %>% 
+  pull(PatientID)
+
+# DxList <- InfecDX
+```
+
+
+```{r}
+
+EDW = DBI::dbConnect(odbc::odbc(), dsn = "MCCBIEDW1")
+
+infec_sql <- glue_sql("
+SELECT [PatientEncounterID] ,[LineNBR] ,[PatientID] ,[PatientEncounterDateRealNBR]
+      ,[ContactDTS] ,a.[DiagnosisID] ,a.[DiagnosisNM], CurrentICD10ListTXT,[DiagnosisDSC],[PrimaryDiagnosisFLG] ,[UpdateDTS]
+  FROM [Epic].[Encounter].[PatientEncounterDiagnosis] a
+  left join [Epic].[Reference].[Diagnosis] b on a.DiagnosisID = b.DiagnosisID
+  where a.DiagnosisID in (select DiagnosisID FROM [Epic].[Reference].[Diagnosis] 
+                    				where (CurrentICD10ListTXT like ('%T81.%') or CurrentICD10ListTXT like ('%T84.%')))
+  and contactdts >= '2014-01-01'
+  and patientid in ({pat*})
+", 
+
+.con = EDW)
+
+infec_ <- dbSendQuery(EDW, infec_sql)
+infec_DX_Output <- dbFetch(infec_)
+
+
+infect_clean_DX <-
+  infec_DX_Output %>% 
+  mutate(DT = as.Date(ContactDTS)) %>%
+  group_by(PatientID) %>% 
+  distinct(PatientID, infectDT = DT) %>% 
+  ungroup() %>% 
+  arrange(PatientID) %>% 
+  group_by(PatientID) %>% 
+  nest(data = c(infectDT)) %>% 
+  mutate(DxCount = lengths(data))
+
+```
+
+# Join surgeries to infections
+
+```{r}
+
+shoul_map_infections <-
+  shoulders_Output %>% 
+  mutate(DT = as.Date(SurgeryDTS),
+         DT_wk = lubridate::floor_date(DT, "week"),
+         DT_infecTest = DT %m+% months(6)) %>% 
+  select(PatientID, DT, DT_infecTest) %>% 
+  left_join(., infect_clean_DX,
+            by = c("PatientID")) %>% 
+  ungroup() %>% 
+  filter(!is.na(DxCount)) %>% 
+  unnest(cols = c(data)) %>%
+  mutate(InfecInterval = interval(DT, DT_infecTest),
+         WithinInfecDT = infectDT %within% InfecInterval) %>% 
+  group_by(PatientID, DT) %>% 
+  mutate(CountInfec = sum(WithinInfecDT)) %>%
+  ungroup() %>% 
+  filter(WithinInfecDT == T) %>% 
+  arrange(PatientID, DT, infectDT) %>% 
+  group_by(PatientID, DT, CountInfec) %>% 
+  summarise(InfectDt_Flagged = toString(infectDT))
+
+
+shoul_clean <-
+  shoulders_Output %>% 
+  mutate(DT = as.Date(SurgeryDTS),
+         DT_wk = lubridate::floor_date(DT, "week"),
+         DT_infecTest = DT %m+% months(6)) %>% 
+  left_join(., shoul_map_infections) %>% 
+  mutate(CountInfec = ifelse(is.na(CountInfec), 0, CountInfec),
+         Proced_Match = ifelse(Proced_Match == 0, F ,T)) %>%
+  select(-InProcID, -InProcedures, -RoomID, -TotalTimeNeededMinutesNBR, -ProcessedByEndOfDayFLG, -CaseRequestID, -InpatientDataID,
+         -LogNM,-CaseRequestID, -CaseID, -PrimaryPhysicianID, -ExternalNM, -EmergencyStatusStoredFLG, -UseProcedureFLG,
+         -DT_infecTest, -BodySectionDSC, -BodyRegionDSC, -ServiceDSC, -SurgeryDTS) %>% 
+  ungroup()
+
+  
+save(shoul_clean, file = here::here("data-raw", "shoul_clean.rda"))  
+
+```
+
+
+
+# Dataset for Heather
+
+```{r}
+
+Shld_Out <-
+  shoul_clean %>% 
+  filter(StatusDSC == "Posted",
+         TimingEventStatusDSC == "Completed",
+         !is.na(CaseClassDSC),
+         !is.na(DepartmentDSC),
+         Proced_Match == T) %>% 
+  ungroup() %>% 
+  mutate(Had_Infection_Dx = ifelse(CountInfec == 0, "No", "Yes")) %>% 
+  select(CaseID = LogID, ProviderNM, DepartmentDSC, SurgeryDTS = DT, CaseClassDSC, PatientTypeDSC, 
+         ProcedureLevelDSC, ProcedureName = AsOrderedProcedureNM,
+         Had_Infection_Dx,InfectDt_Flagged) %>% 
+  mutate(ProcedureName = toupper(trimws(ProcedureName))) %>%
+  ungroup() %>% 
+  arrange(SurgeryDTS, CaseID)
+
+
+```
+
+
+Counts of Patient Type by Loc and Year
+
+```{r}
+
+piv_Loc_Year <-
+  Shld_Out %>% 
+  count(Year =lubridate::year(SurgeryDTS), PatientTypeDSC, DepartmentDSC) %>% 
+  pivot_wider(names_from = Year, values_from = n) %>% 
+  arrange(DepartmentDSC, PatientTypeDSC)
+
+
+```
+
+Provider List 
+
+```{r}
+
+ProvList <- 
+  shoulders_Output %>% 
+  count(PrimaryPhysicianID, ProviderNM, sort=T) %>% 
+  # arrange(n) %>% 
+  ungroup()
+
+```
+
+Infection Yearly Rate
+
+```{r}
+Inf_rate <-
+  Shld_Out %>% 
+  count(Year =lubridate::year(SurgeryDTS), Had_Infection_Dx) %>% 
+  pivot_wider(names_from = Had_Infection_Dx, values_from = n) %>% 
+  mutate(Percentage_Infec = Yes/ (Yes + No))
+  
+```
+
+
+Plot of trends
+
+```{r}
+
+p1 <-
+  Shld_Out %>%
+  mutate(DT_wk = lubridate::floor_date(SurgeryDTS, "month")) %>% 
+  count(DT_wk, CaseClassDSC, DepartmentDSC) %>% 
+  ggplot(aes(DT_wk, n))+
+    geom_line(color="grey")+
+    geom_point(size = 0.9)+
+    facet_grid(CaseClassDSC ~ DepartmentDSC)+
+    theme_cone_facet()+
+  labs(title = "Monthly Count of Surgeries by Location and Case Class",
+       subtitle = glue::glue("For surgeries from {MinDT} - {MaxDT} "),
+       y = NULL, x=NULL)+
+  theme(strip.text = element_text(size =14))
+
+  
+  
+```
+
+
+
+# Write out restults to Excel for Heather
+
+
+```{r write to excel}
+
+wb <- createWorkbook()
+
+addWorksheet(wb, sheetName = "Raw_Data")
+addWorksheet(wb, sheetName = "PatientType_Year")
+addWorksheet(wb, sheetName = "Procedure_List")
+addWorksheet(wb, sheetName = "Provider_List")
+addWorksheet(wb, sheetName = "Infections_Year")
+
+writeDataTable(wb, sheet = 1, x = Shld_Out,
+  colNames = TRUE, rowNames = F,
+  tableStyle = "TableStyleLight9")
+
+writeDataTable(wb, sheet = 2, x = piv_Loc_Year,
+  colNames = TRUE, rowNames = F, xy = c("A", 1),
+  tableStyle = "TableStyleLight9")
+
+writeDataTable(wb, sheet = 3, x = IncludedProc,
+  colNames = TRUE, rowNames = F,
+  tableStyle = "TableStyleLight9")
+
+writeDataTable(wb, sheet = 4, x = ProvList,
+  colNames = TRUE, rowNames = F,
+  tableStyle = "TableStyleLight9")
+
+writeDataTable(wb, sheet = 5, x = Inf_rate,
+  colNames = TRUE, rowNames = F,
+  tableStyle = "TableStyleLight9")
+
+print(p1)
+insertPlot(wb, 1, xy = c("M", 2), width = 28, height = 15,  fileType = "png", units = "cm")
+
+saveWorkbook(wb, file = here::here("output","Shoulder_Surgery_2014_2020.xlsx"), overwrite = TRUE)
+
+```
+
+
+
+
+
+
