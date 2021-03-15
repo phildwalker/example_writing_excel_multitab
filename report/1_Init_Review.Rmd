@@ -1,0 +1,350 @@
+---
+title: "Rockingham Community Health Assessment: Data Review"
+output:
+  html_document:
+    df_print: paged
+    code_folding: show
+    toc: true
+    toc_float: true
+    theme: united
+    highlight: tango
+    includes:
+      after_body: footer.html
+  pdf_document:
+    toc: true
+    number_sections: true
+    df_print: kable
+geometry: margin=1in
+linkcolor: blue
+date: "`r paste0('Last Updated: ', format(Sys.time(), '%d %B, %Y')) `"
+---
+
+<style>
+.list-group-item.active, .list-group-item.active:focus, .list-group-item.active:hover {
+    background-color: #a1e0ff;
+}
+</style>
+
+```{css, echo=FALSE}
+body .main-container {
+  max-width: 100% !important;
+  width: 100% !important;
+    }
+body {
+  max-width: 100% !important;
+    }
+```
+
+```{r init libraries, results='asis', echo=FALSE, include=FALSE}
+library(tidyverse)
+library(DBI)
+library(viridisLite)
+library(glue)
+library(kableExtra)
+library(readxl)
+library(openxlsx)
+library(janitor)
+
+EDW = DBI::dbConnect(odbc::odbc(), dsn = "MCCBIEDW1")
+EDW_sand = DBI::dbConnect(odbc::odbc(), dsn = "MCCBISOLDBDEV1")
+
+# CensusData <- read_excel("./Documentation/State_Review.xlsx", sheet = "Race_Perc")
+
+options(scipen = 999)
+# knitr::opts_chunk$set(echo=FALSE)
+knitr::knit_hooks$set(inline = function(x) { if(!is.numeric(x)){ x }else{ prettyNum(round(x,2), big.mark=",") } })
+
+theme_set(theme_bw())
+
+```
+
+
+\newpage
+
+# Overview
+
+## Objective 
+To provide the refreshed dataset for the 2020 Rockingham Community Health Assessment report.
+
+
+## High Level Summary
+
+_Enter notes here after analysis is complete_
+
+
+
+## Request Information
+__Requestor__: 
+Kathy Colville <br>
+Director ARMC <br>
+Contact: 	Kathy.Colville@conehealth.com <br>
+
+<u>Ask:</u>
+
+<style>
+div.blue { background-color:#a1e0ff; border-radius: 5px; padding: 10px;}
+</style>
+<div class = "blue">
+
+Cone Health is required to prepare a Community Health Needs Assessment every three years to maintain compliance with IRS requirements for tax exempt hospitals. We prepare these reports in collaboration with public health authorities in Alamance, Guilford and Rockingham counties. 
+
+We need information on ED utilization to match the information in the 2016 assessment, so that we can compare utilization from 2015, 2016, 2017, 2018.
+
+
+</div>
+<br>
+
+
+## Additional Requestor Notes
+
+__Specific Data Element Names__
+
+Annie Penn Hospital Emergency Department  
+*  Total Visits by Age Group (<1, 1-17, 18-44, 45-64, 65-84, 85+) for calendar years 2015, 2016, 2017, 2018
+*  Total Visits by Race/Ethnicity (white, black, other) for calendar years 2015, 2016, 2017, 2018
+*  Top Ten Reasons for Emergency Department Visits (diagnoses such as abdominal pain, UTI) for calendar years 2015, 2016, 2017, 2018
+
+Also talked about largely mirroring output that was on page 42 from the prior assessment.
+
+![Screenshot of pg 42 from prior report](Sample_output.jpg)
+
+
+__What is this information being used for?__
+
+Community Health Needs Assessments document current state of health outcomes and utilization and propel a community prioritization process to focus collaborative action on health needs in Rockingham County.
+
+
+__What questions are you trying to answer?__
+
+How does the volume of Emergency Department utilization compare year to year? What are the main reasons that people are using the Emergency Department as a site of care in Rockingham County?
+
+
+# Ideas for Analysis
+
+## Understand the report that is currently available
+
+
+# Data Review
+
+```{r query with variable year}
+
+
+year <- 2012
+
+
+pull_sql <- glue_sql(
+"SELECT a.[PatientEncounterID], a.[DepartmentDSC], a.[PatientID], a.EventDTS, a.DepartmentID, a.ADTEventTypeDSC, 
+	a.ADTEventSubtypeDSC, a.effectiveDTS, b.MRN, b.DeathDTS, b.BirthDTS, b.PatientStatusDSC,
+	b.EthnicGroupDSC, c.PatientRaceDSC,
+	d.[DiagnosisTypeDSC], d.[DiagnosisNormDSC], e.CCSCategoryDSC,
+	g.ReasonNM, g.DisplayTXT, g.CommentTXT
+  FROM [Epic].[Encounter].[ADT] a
+	  left join epic.patient.patient b on (a.patientID = b.patientID)
+	  left join epic.patient.race c on a.patientID = c.patientID
+	  left join [Shared].[Clinical].[Diagnosis] d on a.PatientEncounterID = d.EncounterID
+	  left join [Shared].[Terminology].[AhrqCcs] e on e.codevaluecd = d.diagnosiscd
+	  inner join shared.clinical.FacilityAccount f on d.FacilityAccountID = f.FacilityAccountID
+  	left join epic.Encounter.ReasonForVisit g on a.PatientEncounterID = g.PatientEncounterID
+  where [DepartmentDSC] = 'AP-EMERGENCY DEPT'
+    and year([EventDTS]) >= {yearPull}
+    and a.ADTEventTypeDSC not in ('Census')
+    and f.DischargePhysicalDepartmentNM = 'AP-EMERGENCY DEPT'
+    and year([DiagnosisDTS]) >= {yearPull}
+    and d.EncounterID is not null
+    and d.DiagnosisTypeDSC in ('Primary Diagnosis')
+  order by eventdts",
+  yearPull = year,
+  .con = EDW)
+
+parm_sql <- dbSendQuery(EDW, pull_sql)
+
+ADT_out <- dbFetch(parm_sql)
+dbClearResult(parm_sql)
+
+```
+
+
+
+
+```{sql encounter patient diag, eval=FALSE, connection=EDW, include=FALSE, output.var="ED_AP_Patient_Diagnosis"}
+  SELECT a.[PatientEncounterID], a.[DepartmentDSC], a.[PatientID], a.EventDTS, a.DepartmentID, a.ADTEventTypeDSC, 
+	a.ADTEventSubtypeDSC, a.effectiveDTS, b.MRN, b.DeathDTS, b.BirthDTS, b.PatientStatusDSC,
+	b.EthnicGroupDSC, c.PatientRaceDSC,
+	d.[DiagnosisTypeDSC], d.[DiagnosisNormDSC], e.CCSCategoryDSC
+  FROM [Epic].[Encounter].[ADT] a
+	left join epic.patient.patient b on (a.patientID = b.patientID)
+	left join epic.patient.race c on a.patientID = c.patientID
+	left join [Shared].[Clinical].[Diagnosis] d on a.PatientEncounterID = d.EncounterID
+	left join [Shared].[Terminology].[AhrqCcs] e on e.codevaluecd = d.diagnosiscd
+	inner join shared.clinical.FacilityAccount f on d.FacilityAccountID = f.FacilityAccountID
+  where [DepartmentDSC] = 'AP-EMERGENCY DEPT'
+  --and ADTEventTypeDSC = 'Admission'
+ --and PatientEncounterID in ('655171218')
+  and year([EventDTS]) >= 2019
+  and a.ADTEventTypeDSC not in ('Census')
+  and f.DischargePhysicalDepartmentNM = 'AP-EMERGENCY DEPT'
+  and year([DiagnosisDTS]) >= 2019
+  and d.EncounterID is not null
+  and d.DiagnosisTypeDSC in ('Primary Diagnosis')
+  order by eventdts
+```
+
+```{r clean adt to pull last dispo}
+
+# ADT_clean <-
+#   ED_AP_Patient_Diagnosis %>%
+#   mutate(ADTts = as.POSIXct(effectiveDTS)) %>%
+#   group_by(PatientEncounterID) %>%
+#   arrange(ADTts) %>%
+#   mutate(EventCount = row_number()) %>%
+#   ungroup() %>%
+#   group_by(PatientEncounterID) %>%
+#   filter(EventCount == max(EventCount)) %>%
+#   ungroup()
+
+ADT_clean2 <-
+  ADT_out %>%
+  mutate(ADTts = as.POSIXct(effectiveDTS)) %>%
+  group_by(PatientEncounterID) %>%
+  arrange(ADTts) %>%
+  mutate(EventCount = row_number()) %>%
+  ungroup() %>%
+  group_by(PatientEncounterID) %>%
+  filter(EventCount == max(EventCount),
+         lubridate::year(ADTts) >= year) %>%
+  ungroup() %>% 
+  mutate(Age_Encounter = as.numeric(ADTts - as.POSIXct(BirthDTS))/(365.25*24*60*60),
+         Age_Group = case_when(Age_Encounter < 1 ~ "<1",
+                               Age_Encounter >= 1 & Age_Encounter < 18 ~ "1-17",
+                               Age_Encounter >= 18 & Age_Encounter < 45 ~ "18-44",
+                               Age_Encounter >= 45 & Age_Encounter < 65 ~ "45-64",
+                               Age_Encounter >= 65 & Age_Encounter < 85 ~ "65-84",
+                               Age_Encounter >= 85 ~ "85+"),
+         Race_Group = case_when(PatientRaceDSC %in% c("White or Caucasian") ~ "White",
+                                PatientRaceDSC %in% c("Black or African American") ~ "Black",
+                                TRUE ~ "Other")) %>% 
+  filter(as.Date(ADTts) < lubridate::floor_date(Sys.Date(), "months"))
+           
+# unique(ADT_clean2$PatientRaceDSC)
+# unique(ADT_clean2$Race_Group)
+
+
+
+Reason <- ADT_clean2 %>% 
+  mutate(year = lubridate::year(ADTts)) %>% #,DisplayTXT = ifelse(is.na(DisplayTXT), "Reason Not Included" , DisplayTXT)
+  filter(!is.na(DisplayTXT)) %>% 
+  group_by(DisplayTXT) %>% #year, 
+  count() %>% 
+  ungroup() %>%
+  # pivot_wider(names_from=year, values_from = n) %>% 
+  rename(`Reason for Visit` = DisplayTXT) %>% 
+  # mutate(Total = rowSums(.[2:9], na.rm=TRUE)) %>% 
+  arrange(desc(n)) %>%
+  mutate(Rank = row_number()) %>% 
+  ungroup() %>% 
+  top_n(n=10, wt=n)
+
+Diag <- ADT_clean2 %>% 
+  mutate(year = lubridate::year(ADTts)) %>% 
+  group_by(year, CCSCategoryDSC) %>% 
+  count() %>% 
+  ungroup() %>% 
+  pivot_wider(names_from=year, values_from = n) %>% 
+  rename(`Diagnosis Category` = CCSCategoryDSC) %>% 
+  mutate(Total = rowSums(.[2:9], na.rm=TRUE)) %>% 
+  arrange(desc(Total)) %>% 
+  mutate(Rank = row_number()) %>% 
+  adorn_totals("row")
+
+
+p1 <- ADT_clean2 %>% 
+  mutate(FloorMon = as.Date(lubridate::floor_date(ADTts, "months"))) %>% 
+  group_by(FloorMon, Age_Group) %>% 
+  count() %>% 
+  ggplot(aes(FloorMon, n, fill=Age_Group))+
+  geom_bar(stat="identity", alpha=0.5 )+ #, position="fill"
+  scale_fill_viridis_d() +
+  scale_x_date(breaks = scales::date_breaks("6 months"), expand = c(0,0))+
+  scale_y_continuous( expand = c(0,0))+ #labels = scales::percent_format(accuracy = 1),
+  theme_bw()+
+  theme(axis.text.x = element_text(angle=90, vjust=0.5), axis.title.x = element_blank())+
+  ggtitle("Proportion of Patient Age Groups by Month of Visit")
+  
+
+Age <- ADT_clean2 %>%
+  mutate(year = lubridate::year(ADTts)) %>% 
+  group_by(year, Age_Group) %>% 
+  count() %>% 
+  pivot_wider(names_from=year, values_from = n) %>% 
+  adorn_totals("row")
+
+
+p2 <- ADT_clean2 %>% 
+  mutate(FloorMon = as.Date(lubridate::floor_date(ADTts, "months"))) %>% 
+  group_by(FloorMon, Race_Group) %>% 
+  count() %>% 
+  ggplot(aes(FloorMon, n, fill=Race_Group))+
+  geom_bar(stat="identity", alpha=0.5 )+ #, position="fill"
+  scale_fill_viridis_d(end=.5) +
+  scale_x_date(breaks = scales::date_breaks("6 months"), expand = c(0,0))+
+  scale_y_continuous( expand = c(0,0))+ #labels = scales::percent_format(accuracy = 1),
+  theme_bw()+
+  theme(axis.text.x = element_text(angle=90, vjust=0.5), axis.title.x = element_blank())+
+  ggtitle("Proportion of Patient Race Groups by Month of Visit")
+
+
+Race <- ADT_clean2 %>%
+  mutate(year = lubridate::year(ADTts),
+         Race_Group = factor(Race_Group, levels = c("White", "Black", "Other"))) %>% 
+  group_by(year, Race_Group) %>% 
+  count() %>% 
+  pivot_wider(names_from=year, values_from = n) %>% 
+  adorn_totals("row")
+
+
+
+```
+
+
+
+
+
+
+
+```{r write to excel}
+
+wb <- createWorkbook()
+
+addWorksheet(wb, sheetName = "Top_Diagnosis")
+addWorksheet(wb, sheetName = "Race_Overview")
+addWorksheet(wb, sheetName = "Age_Overview")
+
+writeDataTable(wb, sheet = 1, x = Diag,
+  colNames = TRUE, rowNames = F,
+  tableStyle = "TableStyleLight9")
+
+writeDataTable(wb, sheet = 1, x = Reason,
+  colNames = TRUE, rowNames = F, xy = c("N", 1),
+  tableStyle = "TableStyleLight9")
+
+writeDataTable(wb, sheet = 2, x = Race,
+  colNames = TRUE, rowNames = F,
+  tableStyle = "TableStyleLight9")
+
+writeDataTable(wb, sheet = 3, x = Age,
+  colNames = TRUE, rowNames = F,
+  tableStyle = "TableStyleLight9")
+
+print(p1)
+insertPlot(wb, 3, xy = c("K", 2), width = 18, height = 10,  fileType = "png", units = "cm")
+
+print(p2)
+insertPlot(wb, 2, xy = c("K", 2), width = 18, height = 10,  fileType = "png", units = "cm")
+
+saveWorkbook(wb, file = here::here("output","Rockingham_HealthAssessment_ED.xlsx"), overwrite = TRUE)
+
+```
+
+
+
+
